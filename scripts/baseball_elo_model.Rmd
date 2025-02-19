@@ -1,0 +1,185 @@
+```{r}
+# import necessary libraries
+library(tidyverse)
+
+# import custom functions
+source("../src/modeling/baseball_elo_functions.R")
+```
+
+```{r}
+# load in dataset (drop first column: python index)
+baseball <- read.csv("../data/raw/mlb_game_results.csv")[-1]
+
+# convert Date column to date type
+baseball$Date <- as.Date(baseball$Date, format="%B %d, %Y")
+```
+
+```{r}
+# create dataframe for team-level game logs for both away and home teams
+team_game_log <- baseball |>
+  select(Date, Season, Game, Away.Team, Home.Team, Away.Score, Home.Score, Venue.Latitude, Venue.Longitude) |>
+  pivot_longer(cols = c(Away.Team, Home.Team), names_to = "Away.Home", values_to = "Team") |>
+  mutate(Away.Home = ifelse(Away.Home == "Away.Team", "Away", "Home"),
+         Win = ifelse((Away.Home == "Away" & Away.Score > Home.Score) | (Away.Home == "Home" & Home.Score > Away.Score), 1, 0),
+         Loss = 1 - Win,
+         Regular.Win = ifelse(Game == "regular", Win, 0),
+         Regular.Loss = ifelse(Game == "regular", Loss, 0),
+         Postseason.Win = ifelse(Game == "postseason", Win, 0),
+         Postseason.Loss = ifelse(Game == "postseason", Loss, 0)) |>
+  group_by(Team, Season) |>
+  mutate(Total.Regular.Wins = cumsum(Regular.Win),
+         Total.Regular.Losses = cumsum(Regular.Loss),
+         Total.Postseason.Wins = cumsum(Postseason.Win),
+         Total.Postseason.Losses = cumsum(Postseason.Loss),
+         Previous.Latitude = lag(Venue.Latitude),
+         Previous.Longitude = lag(Venue.Longitude),
+         Rest = as.numeric(Date - lag(Date) - 1)) |>
+  ungroup()
+```
+
+```{r}
+# merge team game logs back into baseball dataset to track wins and losses
+baseball_final <- baseball |>
+  left_join(team_game_log |>
+              filter(Away.Home == "Away") |>
+              select(Team, Date, Total.Regular.Wins, Total.Regular.Losses, Total.Postseason.Wins, Total.Postseason.Losses, Previous.Latitude, Previous.Longitude, Rest) |>
+              rename_with(~ paste0("Away.", .), -c(Team, Date)) |>
+              rename(Away.Team = Team) |>
+              distinct(Away.Team, Date, .keep_all = TRUE),
+            by = c("Away.Team", "Date"), relationship = "many-to-many") |>
+  left_join(team_game_log |>
+              filter(Away.Home == "Home") |>
+              select(Team, Date, Total.Regular.Wins, Total.Regular.Losses, Total.Postseason.Wins, Total.Postseason.Losses, Previous.Latitude, Previous.Longitude, Rest) |>
+              rename_with(~ paste0("Home.", .), -c(Team, Date)) |>
+              rename(Home.Team = Team) |>
+              distinct(Home.Team, Date, .keep_all = TRUE),
+            by = c("Home.Team", "Date"), relationship = "many-to-many") |>
+  group_by(Date, Away.Team, Home.Team) |>
+  mutate(Away.Total.Regular.Wins = ifelse(row_number() == 2 & Away.Score > Home.Score, Away.Total.Regular.Wins + 1, Away.Total.Regular.Wins),
+         Away.Total.Regular.Losses = ifelse(row_number() == 2 & Away.Score < Home.Score, Away.Total.Regular.Losses + 1, Away.Total.Regular.Losses),
+         Home.Total.Regular.Wins = ifelse(row_number() == 2 & Home.Score > Away.Score, Home.Total.Regular.Wins + 1, Home.Total.Regular.Wins),
+         Home.Total.Regular.Losses = ifelse(row_number() == 2 & Home.Score < Away.Score, Home.Total.Regular.Losses + 1, Home.Total.Regular.Losses)) |>
+  ungroup() |>
+  mutate(Away.Travel = mapply(calc_distance, Away.Previous.Latitude, Away.Previous.Longitude, Venue.Latitude, Venue.Longitude),
+         Home.Travel = mapply(calc_distance, Home.Previous.Latitude, Home.Previous.Longitude, Venue.Latitude, Venue.Longitude),
+         Away.Travel = coalesce(Away.Travel, 0),
+         Home.Travel = coalesce(Home.Travel, 0),
+         Away.Rest = ifelse(is.na(Away.Rest), 3, pmin(Away.Rest, 3)),
+         Home.Rest = ifelse(is.na(Home.Rest), 3, pmin(Home.Rest, 3)))
+```
+
+```{r}
+# initialize elo ratings and pre-game metrics
+baseball_final <- baseball_final |>
+  mutate(Away.Elo = NA,
+         Home.Elo = NA,
+         Away.Pregame.Elo = NA,
+         Home.Pregame.Elo = NA,
+         Away.Win.Prob = NA,
+         Home.Win.Prob = NA,
+         Prediction = NA)
+
+# initialize starting elo ratings for all teams
+current_team_elo <- baseball_final |>
+  select(Team = Home.Team) |>
+  distinct(Team) |>
+  arrange(Team) |>
+  mutate(Elo = 1500)
+
+# create dataframe to track historical elo ratings
+historical_team_elo <- tibble(
+  Date = as.Date(character()),
+  Team = character(),
+  Elo = numeric(),
+  Regular.Wins = integer(),
+  Regular.Losses = integer(),
+  Postseason.Wins = integer(),
+  Postseason.Losses = integer()
+)
+```
+
+```{r}
+# define k-values 
+k_regular <- 5
+k_postseason <- 10
+
+# loop through all games and update elo ratings
+for (i in 1:nrow(baseball_final)){
+  game_date <- baseball_final$Date[i]
+  game_type <- baseball_final$Game[i]
+  away_team <- baseball_final$Away.Team[i]
+  home_team <- baseball_final$Home.Team[i]
+  away_score <- baseball_final$Away.Score[i]
+  home_score <- baseball_final$Home.Score[i]
+  away_regular_wins <- baseball_final$Away.Total.Regular.Wins[i]
+  away_regular_losses <- baseball_final$Away.Total.Regular.Losses[i]
+  home_regular_wins <- baseball_final$Home.Total.Regular.Wins[i]
+  home_regular_losses <- baseball_final$Home.Total.Regular.Losses[i]
+  away_postseason_wins <- baseball_final$Away.Total.Postseason.Wins[i]
+  away_postseason_losses <- baseball_final$Away.Total.Postseason.Losses[i]
+  home_postseason_wins <- baseball_final$Home.Total.Postseason.Wins[i]
+  home_postseason_losses <- baseball_final$Home.Total.Postseason.Losses[i]
+  
+  # determine k-value based on regular or postseason game
+  k <- ifelse(game_type == "postseason", k_postseason, k_regular)
+  
+  # get current elo rating for away and home team
+  baseball_final$Away.Elo[i] <- current_team_elo$Elo[current_team_elo$Team == away_team]
+  baseball_final$Home.Elo[i] <- current_team_elo$Elo[current_team_elo$Team == home_team]
+  
+  # calculate pre-game elo rating for away and home team
+  baseball_final$Away.Pregame.Elo[i] <- baseball_final$Away.Elo[i] + calc_adjustment(baseball_final$Away.Travel[i], baseball_final$Away.Rest[i], "away")
+  baseball_final$Home.Pregame.Elo[i] <- baseball_final$Home.Elo[i] + calc_adjustment(baseball_final$Home.Travel[i], baseball_final$Home.Rest[i], "home")
+  
+  # calculate win probability based on pre-game elo rating
+  baseball_final$Away.Win.Prob[i] <- calc_win_prob(baseball_final$Away.Pregame.Elo[i], baseball_final$Home.Pregame.Elo[i])
+  baseball_final$Home.Win.Prob[i] <- 1 - baseball_final$Away.Win.Prob[i]
+  
+  # store prediction accuracy
+  baseball_final$Prediction[i] <- as.numeric((baseball_final$Away.Win.Prob[i] > baseball_final$Home.Win.Prob[i]) == (baseball_final$Away.Score[i] > baseball_final$Home.Score[i]))
+  
+  # update elo ratings after a game
+  current_team_elo <- calc_new_elo(current_team_elo, away_team, home_team, away_score, home_score, k)
+  
+  postgame_away_elo <- current_team_elo$Elo[current_team_elo$Team == away_team]
+  postgame_home_elo <- current_team_elo$Elo[current_team_elo$Team == home_team]
+  
+  # store updated elo ratings in historical dataframe
+  historical_team_elo <- rbind(historical_team_elo,
+                            data.frame(Date = game_date,
+                                       Team = away_team,
+                                       Elo = postgame_away_elo,
+                                       Regular.Wins = away_regular_wins,
+                                       Regular.Losses = away_regular_losses,
+                                       Postseason.Wins = away_postseason_wins,
+                                       Postseason.Losses = away_postseason_losses),
+                            data.frame(Date = game_date,
+                                       Team = home_team,
+                                       Elo = postgame_home_elo,
+                                       Regular.Wins = home_regular_wins,
+                                       Regular.Losses = home_regular_losses,
+                                       Postseason.Wins = home_postseason_wins,
+                                       Postseason.Losses = home_postseason_losses))
+}
+```
+
+```{r}
+# save new datasets
+write_csv(baseball_final, "../data/processed/mlb_game_results_final.csv")
+write_csv(current_team_elo, "../data/processed/mlb_elo_current.csv")
+write_csv(historical_team_elo, "../data/processed/mlb_elo_history.csv")
+```
+
+```{r}
+# calculate overall model accuracy
+mean(baseball_final$Prediction)
+```
+
+```{r}
+# training set: 2005-2011
+# accuracy of elo-model with initial training set (every team doesn't start at an elo rating of 1500)
+test <- subset(baseball_final, Season >= 2012)
+
+# calculate accuracy of testing set
+mean(test$Prediction)
+```
