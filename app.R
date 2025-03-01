@@ -1,6 +1,7 @@
 # import necessary libraries
 library(shiny)
 library(tidyverse)
+library(shinythemes)
 library(plotly)
 library(DT)
 
@@ -57,6 +58,7 @@ team_colors <- c(
 # define UI
 ui <- fluidPage(
   titlePanel("MLB Elo Ratings"),
+  theme = shinytheme("slate"),
   tabsetPanel(
     # historical elo ratings tab
     tabPanel("Historical",
@@ -64,7 +66,9 @@ ui <- fluidPage(
                sidebarPanel(
                  selectInput("Team1", "Select Team:", choices = sort(unique(elo_history$Team))),
                  selectInput("Team2", "Compare With:", choices = c("None", sort(unique(elo_history$Team))), selected = "None"),
-                 dateRangeInput("DateRange", "Select Date Range:", start = as.Date(paste0(min(elo_history$Season), "-01-01")), end = as.Date(paste0(max(elo_history$Season), "-12-31")))
+                 dateRangeInput("DateRange", "Select Date Range:", 
+                                start = as.Date(paste0(min(elo_history$Season), "-01-01")), 
+                                end = as.Date(paste0(max(elo_history$Season), "-12-31")))
                ),
                mainPanel(
                  plotlyOutput("EloPlot"),
@@ -99,18 +103,26 @@ server <- function(input, output){
       mutate(Record = ifelse(Postseason.Wins == 0 & Postseason.Losses == 0, Regular.Record, Postseason.Record),
              Breaks = c(0, diff(Date) > 30)) # create breaks in plot for offseason
     
-    # filter for each team's highest elo
+    # filter for each team's highest elo within given date range
     elo_highest <- filtered_history |>
       group_by(Team) |>
       filter(Elo == max(Elo))
     
-    history_plot <- ggplot(filtered_history, aes(x = Date, y = Elo, color = Team, group = Team, text = paste("Date:", Date,"<br>Team:", Team, "<br>Elo:", Elo,"<br>Record:", Record))) +
+    history_plot <- ggplot(filtered_history, aes(x = Date, y = Elo, color = Team, group = Team, 
+                                                 text = paste("Date:", Date,"<br>Team:", Team, "<br>Elo:", Elo, "<br>Record:", Record))) +
       geom_line(aes(group = cumsum(Breaks)), linewidth = 0.75) +
-      geom_point(data = elo_highest, aes(x = Date, y = Elo), size = 3, shape = 21, fill = "white") +
+      geom_point(data = elo_highest, aes(x = Date, y = Elo), size = 3, shape = 21, fill = "white") + # white point for highest elo
       scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
       scale_color_manual(values = team_colors) +
       labs(title = "MLB Team Elo", x = "Season", y = "Elo Rating") +
-      theme_minimal()
+      theme_minimal() + 
+      theme(
+        plot.background = element_rect(fill = "#D3D3D3"),
+        panel.background = element_rect(fill = "#D3D3D3"),
+        plot.title = element_text(hjust = 0.5, color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black")
+      )
     
     ggplotly(history_plot, tooltip = "text", height = 425)
   })
@@ -128,6 +140,7 @@ server <- function(input, output){
       options = list(
         ordering = TRUE,
         paging = FALSE,
+        searching = FALSE,
         columnDefs = list(
           list(targets = c(4, 5, 6, 7), visible = FALSE),
           list(targets = 1, orderSequence = c("desc", "asc")),
@@ -136,13 +149,15 @@ server <- function(input, output){
         )
       ),
       rownames = FALSE) |>
-      formatStyle(columns = c("Team", "Elo", "Regular Season Record", "Postseason Record"), border = "1px solid #ddd")
+      formatStyle(columns = c("Team", "Elo", "Regular Season Record", "Postseason Record"), 
+                  border = "1px solid #ddd",
+                  color = "black")
   })
   
   # center table headers and rows
   output$FinalEloTableCSS <- renderUI({
-    tags$style(HTML("#FinalEloTable th {text-align: center;}
-                    #FinalEloTable td {text-align: center;}")
+    tags$style(HTML("#FinalEloTable th {text-align: center; background-color: #D3D3D3;}
+                    #FinalEloTable td {text-align: center; background-color: #D3D3D3;}")
     )
   })
 }
